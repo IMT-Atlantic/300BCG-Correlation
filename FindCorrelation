@@ -1,0 +1,176 @@
+setwd("D:/Rproject/BulkEpigeneticProgram/300BCG")
+
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+library(org.Hs.eg.db)
+library(GenomicRanges)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(pheatmap)
+
+# Data Loading
+Data <- read.csv("E:/BioBank/CohortStudy/BCG300/GSE241092_countData_allSamples.csv")
+rownames(Data) <- Data[, 1]   
+Data <- Data[, -1] 
+Index <- read.csv("E:/BioBank/CohortStudy/BCG300/GSE241092_region_annotations.csv")
+TableS1 <- "E:/BioBank/CohortStudy/BCG300/表S1_300BCG队列样本注释_免疫反应评分_ATAC-seq和scRNA-seq质量.xlsx"
+ImmuneScore <- read_excel(TableS1, sheet = "immune_response_scores")
+
+# Annotation
+peaks <- GRanges(seqnames = Index$chr,
+                 ranges = IRanges(start = Index$start, end = Index$end),
+                 peak_id = Index$peak_id)
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene 
+peakAnno <- annotatePeak(peaks, TxDb = txdb, tssRegion = c(-3000, 3000), verbose = FALSE, 
+                         annoDb = "org.Hs.eg.db")
+peakAnnoDF <- as.data.frame(peakAnno)
+
+alkbh4_peaks <- peakAnnoDF %>% filter(SYMBOL == "ALKBH4")
+Data_with_rownames <- rownames_to_column(Data, var = "rownames")
+DataAlkbh4 <- Data_with_rownames %>% filter(rownames %in% c("CONS00000106956", "CONS00000106957", "CONS00000106958", 'CONS00000107000'))
+rownames(DataAlkbh4) <- DataAlkbh4[, 1]
+DataAlkbh4 <- DataAlkbh4[, -1]
+
+# Time Point Division
+timepoints <- gsub(".*_(d\\d+)_.*", "\\1", colnames(DataAlkbh4))
+Data_d0 <- DataAlkbh4[, timepoints == "d0"]
+Data_d14 <- DataAlkbh4[, timepoints == "d14"]
+Data_d90 <- DataAlkbh4[, timepoints == "d90"]
+
+# Cell Type Division For Day0
+CellType <- gsub(".*_d90_(.*)", "\\1", colnames(Data_d90))
+unique(CellType)
+Data_d90_PBMC <- Data_d90[, CellType == 'PBMC']
+Data_d90_cd8t <- Data_d90[, CellType == 'cd8t']
+Data_d90_monocyte <- Data_d90[, CellType == 'monocyte']
+Data_d90_nkcell <- Data_d90[, CellType == 'nkcell']
+
+# Draw Histogram
+# 6958 is promoter
+Data_d90_long <- as.data.frame(t(Data_d90))
+colnames(Data_d90_long) <- rownames(Data_d90)  
+Data_d90_long <- gather(Data_d90_long, key = "RowName", value = "Value", -RowName)
+ggplot(Data_d90_long, aes(x = Value)) + 
+  geom_histogram(binwidth = 1, color = "black", fill = "lightblue") +
+  facet_wrap(~ RowName, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Distribution of Each Row in Data_d90",
+       x = "Value",
+       y = "Frequency")
+
+# Find Correlation Own
+colnames_data <- colnames(Data_d90_PBMC)
+ids <- gsub("X(\\d+BCG\\d+)_d90_PBMC", "\\1", colnames_data)
+colnames(Data_d90_PBMC) <- ids
+common_ids <- intersect(ids, ImmuneScore$Individual)
+Data_d90_PBMC_Correlation <- Data_d90_PBMC[, ids %in% common_ids]
+
+# Find Correlation GPT OneStepMethod
+# 提取 Data_d90_PBMC_Correlation 和 ImmuneScore 中的共同个体
+common_individuals <- intersect(colnames(Data_d90_PBMC_Correlation), ImmuneScore$Individual)
+
+# 筛选两个矩阵，只保留共同个体
+Data_d90_PBMC_Correlation_filtered <- Data_d90_PBMC_Correlation[, common_individuals]
+ImmuneScore_filtered <- ImmuneScore[ImmuneScore$Individual %in% common_individuals, ]
+
+# 查看筛选后的数据
+head(Data_d90_PBMC_Correlation_filtered)
+head(ImmuneScore_filtered)
+
+# 提取免疫评分列
+trained_scores <- ImmuneScore_filtered$`Trained immunity score`
+adaptive_scores <- ImmuneScore_filtered$`Adaptive immunity score`
+
+# 计算每个 CONS 基因与 Trained immunity score 和 Adaptive immunity score 的相关性
+cor_trained <- apply(Data_d90_PBMC_Correlation_filtered, 1, function(x) cor(x, trained_scores, use = "complete.obs"))
+cor_adaptive <- apply(Data_d90_PBMC_Correlation_filtered, 1, function(x) cor(x, adaptive_scores, use = "complete.obs"))
+
+# 合并相关性结果
+cor_results <- data.frame(
+  CONS_ID = rownames(Data_d90_PBMC_Correlation_filtered),
+  Correlation_with_Trained_Immunity = cor_trained,
+  Correlation_with_Adaptive_Immunity = cor_adaptive
+)
+
+# Linear Regression
+# 获取共同个体
+common_individuals <- intersect(colnames(Data_d90_PBMC_Correlation), ImmuneScore$Individual)
+
+# 筛选 Data_d0_PBMC_Correlation 和 ImmuneScore 中的共同个体
+Data_d90_PBMC_Correlation_filtered <- Data_d90_PBMC_Correlation[, common_individuals]
+ImmuneScore_filtered <- ImmuneScore[ImmuneScore$Individual %in% common_individuals, ]
+
+# 合并数据，确保按相同的个体排序
+merged_data <- data.frame(
+  Individual = common_individuals,
+  Trained_Immunity_Score = ImmuneScore_filtered$`Trained immunity score`,
+  Adaptive_Immunity_Score = ImmuneScore_filtered$`Adaptive immunity score`,
+  t(Data_d90_PBMC_Correlation_filtered)  # 转置 Data_d90_PBMC_Correlation，以便每个基因成为一行
+)
+
+# 查看合并后的数据
+head(merged_data)
+# 创建一个空的列表来存储回归结果
+regression_results <- list()
+
+# 对每个基因进行回归分析
+for (gene in rownames(Data_d90_PBMC_Correlation_filtered)) {
+  # 提取该基因的数据
+  gene_data <- merged_data[, c("Trained_Immunity_Score", "Adaptive_Immunity_Score", gene)]
+  
+  # 线性回归分析：Trained immunity score 与基因表达
+  lm_trained <- lm(as.formula(paste(gene, "~ Trained_Immunity_Score")), data = gene_data)
+  
+  # 线性回归分析：Adaptive immunity score 与基因表达
+  lm_adaptive <- lm(as.formula(paste(gene, "~ Adaptive_Immunity_Score")), data = gene_data)
+  
+  # 提取回归系数和 p 值
+  regression_results[[gene]] <- list(
+    Trained_Immunity_Coefficient = coef(lm_trained)["Trained_Immunity_Score"],
+    Trained_Immunity_PValue = summary(lm_trained)$coefficients["Trained_Immunity_Score", "Pr(>|t|)"],
+    Adaptive_Immunity_Coefficient = coef(lm_adaptive)["Adaptive_Immunity_Score"],
+    Adaptive_Immunity_PValue = summary(lm_adaptive)$coefficients["Adaptive_Immunity_Score", "Pr(>|t|)"]
+  )
+}
+
+# 将回归结果整理成数据框
+regression_df <- do.call(rbind, lapply(names(regression_results), function(gene) {
+  data.frame(
+    Gene = gene,
+    Trained_Immunity_Coefficient = regression_results[[gene]]$Trained_Immunity_Coefficient,
+    Trained_Immunity_PValue = regression_results[[gene]]$Trained_Immunity_PValue,
+    Adaptive_Immunity_Coefficient = regression_results[[gene]]$Adaptive_Immunity_Coefficient,
+    Adaptive_Immunity_PValue = regression_results[[gene]]$Adaptive_Immunity_PValue
+  )
+}))
+
+# 查看回归分析结果
+head(regression_df)
+# 选择一个基因进行可视化（例如：CONS00000106956）
+selected_gene <- "CONS00000107000"
+
+# 提取该基因的数据
+df_gene <- merged_data[, c("Trained_Immunity_Score", "Adaptive_Immunity_Score", selected_gene)]
+colnames(df_gene) <- c("Trained_Immunity_Score", "Adaptive_Immunity_Score", "Gene_Expression")
+
+# 绘制散点图和回归线：Trained immunity score vs Gene Expression
+library(ggplot2)
+ggplot(df_gene, aes(x = Trained_Immunity_Score, y = Gene_Expression)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = paste("Correlation between", selected_gene, "and Trained Immunity Score"),
+       x = "Trained Immunity Score",
+       y = "Gene Expression") +
+  theme_minimal()
+
+# 绘制散点图和回归线：Adaptive immunity score vs Gene Expression
+ggplot(df_gene, aes(x = Adaptive_Immunity_Score, y = Gene_Expression)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = paste("Correlation between", selected_gene, "and Adaptive Immunity Score"),
+       x = "Adaptive Immunity Score",
+       y = "Gene Expression") +
+  theme_minimal()
